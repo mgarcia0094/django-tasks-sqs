@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
 ### Added
 
 - `SQSBackend.enqueue_many()` / `aenqueue_many()` enqueue many tasks with
@@ -16,6 +18,15 @@ All notable changes to this project are documented here. The format follows
 - Worker health checks and metrics (#4): `sqs_worker --health-port` serves `/healthz`
   and Prometheus `/metrics`; `Worker.stats` exposes counters and liveness; the new
   `message_processed` signal carries queue, outcome and duration for other backends.
+
+### Changed
+
+- The message envelope gains a `priority` field. Workers keep reading 0.1.0 messages,
+  and 0.1.0 workers ignore the new field, so rolling upgrades are safe.
+
+### Internal
+
+- Integration tests run the backend and worker against LocalStack in CI (#6).
 
 ## [0.1.0] - 2026-09-25
 

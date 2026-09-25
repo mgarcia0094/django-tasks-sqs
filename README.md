@@ -71,6 +71,8 @@ The queues must already exist. Create them with your usual infrastructure toolin
   the task runs, so another worker doesn't pick it up halfway through.
 - **Graceful shutdown:** on `SIGTERM`/`SIGINT` the worker finishes its current tasks and
   exits. Plays well with ECS, Kubernetes and systemd.
+- **Priorities:** `task.using(priority=...)` routes to one SQS queue per priority
+  level, and workers poll the higher levels more often (see below).
 - **Batch enqueue:** `backend.enqueue_many(...)` sends many tasks with
   `SendMessageBatch` (see below).
 - **Health checks and metrics:** `--health-port` serves `/healthz` and Prometheus
@@ -124,7 +126,7 @@ travels, never code or pickles:
 ```json
 {"v": 1, "id": "…", "task": "myapp.tasks.send_welcome_email",
  "args": [], "kwargs": {"user_id": 42}, "queue_name": "default",
- "backend": "default", "enqueued_at": "2026-09-25T10:00:00+00:00", "run_after": null}
+ "backend": "default", "enqueued_at": "2026-09-25T10:00:00+00:00", "run_after": null, "priority": 0}
 ```
 
 The task path is also sent as a message attribute (`task`), which is handy for
@@ -213,6 +215,9 @@ python manage.py sqs_worker --health-port 8000
   | `django_tasks_sqs_last_poll_age_seconds` | gauge | Seconds since the stalest idle thread polled |
   | `django_tasks_sqs_healthy` | gauge | 1 or 0, as `/healthz` |
 
+  `queue` is the SQS queue name without prefix, including the priority suffix if any
+  (`emails-high`). The same goes for `queue_name` in the signal below.
+
 For CloudWatch, StatsD or anything else, connect to the `message_processed` signal. It
 is sent after every message with `worker`, `queue_name`, `outcome` and `duration`
 (seconds):
@@ -229,6 +234,43 @@ def record(sender, queue_name, outcome, duration, **kwargs):
 When running a `Worker` from code, the same data is in `worker.stats`, and
 `django_tasks_sqs.health.HealthServer(worker, port=...)` serves the endpoints.
 
+## Priorities
+
+SQS has no priorities, so the backend emulates them with one SQS queue per priority
+level. Configure the levels, highest first, as `(min_priority, suffix)`:
+
+```python
+"OPTIONS": {
+    "queue_name_prefix": "myapp-",
+    "priority_levels": [
+        (50, "-high"),   # priority >= 50   -> myapp-emails-high
+        (0, ""),         # 0 <= priority < 50 -> myapp-emails
+        (-100, "-low"),  # priority < 0     -> myapp-emails-low
+    ],
+},
+```
+
+```python
+send_email.using(priority=80).enqueue(...)   # goes to myapp-emails-high
+```
+
+- Every queue in `QUEUES` gets every level, and all those SQS queues must exist. For
+  FIFO queues the suffix goes before `.fifo` (`orders-high.fifo`). With `queue_urls`,
+  use the suffixed names as keys (`"emails-high": "https://…"`).
+- A priority lower than every `min_priority` goes to the last level.
+- Without `priority_levels`, the backend keeps `supports_priority = False` and rejects
+  tasks with a non-default priority, as before.
+
+**Polling.** Each worker thread tries the levels of its queue in a random order weighted
+by each level's weight. It checks all but the last without waiting and long-polls the
+last one. Weights default to powers of two (4, 2, 1 for three levels), so the top level
+is checked first 4 times out of 7. Set them explicitly with a third element:
+`(50, "-high", 10)`. Low levels are never starved, but a high-priority task can wait up
+to `--wait-time` seconds while a thread long-polls a lower level. Lower `--wait-time` if
+that matters more to you than the number of receive calls.
+
+Deferred tasks stay on their level when the worker re-sends them.
+
 ## Things to know
 
 - **Delivery is at least once.** That is how SQS works: a task can run more than once,
@@ -236,8 +278,6 @@ When running a `Worker` from code, the same data is in `worker.stats`, and
   tasks idempotent.
 - **No result storage (yet).** `supports_get_result = False`, so `task.get_result(id)`
   raises `NotImplementedError`. Store results yourself if you need them.
-- **No priorities.** SQS has none. Use separate queues and give the important ones more
-  workers.
 - **FIFO queues don't support `run_after`,** because SQS has no per-message delay on
   FIFO queues.
 - **Messages are limited to 256 KB.** Pass IDs, not big payloads.
@@ -263,7 +303,7 @@ Ideas where help is very welcome. Open an issue to discuss before starting somet
 
 - [ ] Optional result storage (e.g. in the Django database), so `get_result()` works
 - [x] Batch sends (`SendMessageBatch`) for enqueueing many tasks at once
-- [ ] Priorities emulated with several queues and weighted polling
+- [x] Priorities emulated with several queues and weighted polling
 - [x] Health check and metrics hooks for the worker (Prometheus / CloudWatch)
 - [ ] Payloads over 256 KB stored in S3 (extended client pattern)
 - [x] Integration tests against LocalStack in CI

@@ -82,17 +82,21 @@ def test_threads_are_busy_while_running_tasks(sqs: SQSClient) -> None:
 
 def test_poll_errors_are_counted(sqs: SQSClient) -> None:
     w = Worker(options=NO_WAIT)
+    receive = w.backend.client.receive_message
     calls = 0
 
-    def flaky(queue_name: str) -> list[str]:
+    def flaky(**kwargs: Any) -> Any:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("network down")
         w.stop()
-        return []
+        return receive(**kwargs)
 
-    with mock.patch.object(w, "run_once", flaky), mock.patch.object(w._stop, "wait"):
+    with (
+        mock.patch.object(w.backend.client, "receive_message", flaky),
+        mock.patch.object(w._stop, "wait"),
+    ):
         w._poll_forever("default")
     assert w.stats.poll_errors == {"default": 1, "emails": 0, "orders.fifo": 0}
 

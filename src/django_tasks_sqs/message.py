@@ -30,6 +30,7 @@ class TaskMessage:
     backend: str
     enqueued_at: datetime
     run_after: datetime | None = None
+    priority: int = 0
 
     def to_json(self) -> str:
         return json.dumps(
@@ -43,6 +44,7 @@ class TaskMessage:
                 "backend": self.backend,
                 "enqueued_at": self.enqueued_at.isoformat(),
                 "run_after": self.run_after.isoformat() if self.run_after else None,
+                "priority": self.priority,
             },
             separators=(",", ":"),
         )
@@ -64,6 +66,7 @@ class TaskMessage:
                 run_after=(
                     datetime.fromisoformat(data["run_after"]) if data["run_after"] else None
                 ),
+                priority=int(data.get("priority", 0)),  # absent in 0.1.0 messages
             )
         except InvalidMessage:
             raise

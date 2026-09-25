@@ -14,7 +14,7 @@ from django.tasks.signals import task_enqueued
 from mypy_boto3_sqs import SQSClient
 
 from django_tasks_sqs import EnqueueBatchError, SQSBackend
-from django_tasks_sqs.backend import MAX_DELAY_SECONDS, delay_seconds
+from django_tasks_sqs.backend import MAX_DELAY_SECONDS, TaskCall, _request_size, delay_seconds
 from tests import tasks
 from tests.conftest import sqs_backend
 
@@ -244,9 +244,16 @@ def test_enqueue_many_splits_into_batches_of_ten(sqs: SQSClient) -> None:
 
 def test_enqueue_many_splits_by_size(sqs: SQSClient) -> None:
     backend = sqs_backend()
-    # Each message is a bit over 1000 bytes, so only two fit under the limit.
-    with spy_batches(backend) as spy, mock.patch("django_tasks_sqs.backend.MAX_BATCH_BYTES", 2500):
-        backend.enqueue_many([(tasks.send_email, ["x" * 1000], {}) for _ in range(3)])
+    calls: list[TaskCall] = [(tasks.send_email, ["x" * 1000], {}) for _ in range(3)]
+    with spy_batches(backend) as spy:
+        backend.enqueue_many(calls[:1])
+    size = _request_size(spy.call_args.kwargs["Entries"][0])
+    # Room for two messages, not three.
+    with (
+        spy_batches(backend) as spy,
+        mock.patch("django_tasks_sqs.backend.MAX_BATCH_BYTES", int(size * 2.5)),
+    ):
+        backend.enqueue_many(calls)
     assert [len(c.kwargs["Entries"]) for c in spy.call_args_list] == [2, 1]
 
 

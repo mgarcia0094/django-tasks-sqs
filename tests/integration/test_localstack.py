@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from datetime import timedelta
+from typing import Any
 
 from django.utils import timezone
 from mypy_boto3_sqs import SQSClient
@@ -137,3 +138,25 @@ def test_enqueue_many(sqs: SQSClient, prefix: str) -> None:
     assert set(added) == {(i, i) for i in range(12)}
     assert len([name for name, _ in tasks.calls if name == "send_email"]) == 5
     assert [a for name, a in tasks.calls if name == "place_order"] == list(range(12))
+
+
+def test_priority_levels(sqs: SQSClient, prefix: str, settings: Any) -> None:
+    urls = [
+        sqs.create_queue(QueueName=f"{prefix}default{s}")["QueueUrl"] for s in ("-high", "-low")
+    ]
+    levels = [(50, "-high"), (0, ""), (-100, "-low")]
+    options = {**settings.TASKS["default"]["OPTIONS"], "priority_levels": levels}
+    settings.TASKS = {"default": {**settings.TASKS["default"], "OPTIONS": options}}
+    try:
+        tasks.add.using(priority=80).enqueue(1, 1)
+        tasks.add.enqueue(2, 2)
+        assert pending(sqs, f"{prefix}default-high") == 1
+        assert pending(sqs, f"{prefix}default") == 1
+        w = Worker(options=WorkerOptions(wait_time_seconds=1, heartbeat=False))
+        outcomes = w.run_once("default") + w.run_once("default")
+        assert outcomes == [Outcome.SUCCEEDED, Outcome.SUCCEEDED]
+        assert {args for _, args in tasks.calls} == {(1, 1), (2, 2)}
+        assert w.stats.messages["default-high", Outcome.SUCCEEDED] == 1
+    finally:
+        for url in urls:
+            sqs.delete_queue(QueueUrl=url)

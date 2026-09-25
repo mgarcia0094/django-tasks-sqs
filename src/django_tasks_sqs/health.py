@@ -28,6 +28,7 @@ class WorkerStats:
     """
 
     def __init__(self, queue_names: Iterable[str] = ()) -> None:
+        queue_names = list(queue_names)
         self._lock = threading.Lock()
         self._messages: Counter[tuple[str, str]] = Counter(
             {(queue, outcome): 0 for queue in queue_names for outcome in OUTCOMES}

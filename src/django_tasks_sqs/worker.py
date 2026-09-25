@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from collections.abc import Iterator
@@ -98,7 +99,10 @@ class Worker:
         self.worker_id = get_random_string(32)
         self._stop = threading.Event()
         self._visibility_timeouts: dict[str, int] = {}
-        self.stats = WorkerStats(self.queue_names)
+        self._random = random.Random()
+        #: SQS queues (names without prefix) behind each task queue, with polling weights.
+        self.sqs_queues = {q: backend.sqs_queue_names(q) for q in self.queue_names}
+        self.stats = WorkerStats(name for q in self.queue_names for name, _ in self.sqs_queues[q])
 
     # --------------------------------------------------------------- lifecycle
 
@@ -138,34 +142,57 @@ class Worker:
             try:
                 self.run_once(queue_name)
             except Exception:
-                self.stats.poll_failed(queue_name)
                 logger.exception("Error polling queue %s; retrying in 5s", queue_name)
                 self._stop.wait(5)
 
     # ---------------------------------------------------------------- polling
 
     def run_once(self, queue_name: str, *, wait_time_seconds: int | None = None) -> list[str]:
-        """Receive one batch from ``queue_name`` and process it. Returns the outcomes."""
+        """Receive one batch from ``queue_name`` and process it. Returns the outcomes.
+
+        With priority levels, the level queues are tried in a random order weighted
+        by their ``weight``: all but the last without waiting, the last with long
+        polling. Busy high-priority queues are served more often, and low ones are
+        never starved.
+        """
+        wait = self.options.wait_time_seconds if wait_time_seconds is None else wait_time_seconds
+        order = self._polling_order(queue_name)
+        for i, sqs_queue in enumerate(order):
+            messages = self._receive(sqs_queue, wait if i == len(order) - 1 else 0)
+            if messages:
+                with self.stats.busy():
+                    return [self.process(sqs_queue, m) for m in messages]
+        return []
+
+    def _polling_order(self, queue_name: str) -> list[str]:
+        """Weighted random order (Efraimidis-Spirakis) of a task queue's SQS queues."""
+        levels = self.sqs_queues[queue_name]
+        if len(levels) == 1:
+            return [levels[0][0]]
+        keyed = [(self._random.random() ** (1 / weight), name) for name, weight in levels]
+        return [name for _, name in sorted(keyed, reverse=True)]
+
+    def _receive(self, sqs_queue: str, wait_time_seconds: int) -> list[MessageTypeDef]:
         request: dict[str, Any] = {
-            "QueueUrl": self.backend.get_queue_url(queue_name),
+            "QueueUrl": self.backend.get_queue_url(sqs_queue),
             "MaxNumberOfMessages": self.options.max_messages,
-            "WaitTimeSeconds": (
-                self.options.wait_time_seconds if wait_time_seconds is None else wait_time_seconds
-            ),
+            "WaitTimeSeconds": wait_time_seconds,
             "MessageSystemAttributeNames": ["ApproximateReceiveCount"],
         }
         if self.options.visibility_timeout is not None:
             request["VisibilityTimeout"] = self.options.visibility_timeout
-        response = self.backend.client.receive_message(**request)
+        try:
+            response = self.backend.client.receive_message(**request)
+        except Exception:
+            self.stats.poll_failed(sqs_queue)
+            raise
         self.stats.polled()
-        messages = response.get("Messages", [])
-        if not messages:
-            return []
-        with self.stats.busy():
-            return [self.process(queue_name, m) for m in messages]
+        return response.get("Messages", [])
 
     def process(self, queue_name: str, sqs_message: MessageTypeDef) -> str:
-        """Handle a single received SQS message. Returns an :class:`Outcome` value."""
+        """Handle a message received from ``queue_name`` (the SQS queue name without
+        prefix, which includes the priority suffix if any). Returns an :class:`Outcome`.
+        """
         started = time.monotonic()
         outcome = self._process(queue_name, sqs_message)
         self.stats.processed(queue_name, outcome)
@@ -224,7 +251,9 @@ class Worker:
         if not isinstance(task, Task):
             raise InvalidMessage(f"{message.task_path!r} is not a django.tasks Task")
         try:
-            return task.using(queue_name=message.queue_name, backend=message.backend)
+            return task.using(
+                queue_name=message.queue_name, backend=message.backend, priority=message.priority
+            )
         except (InvalidTask, InvalidTaskBackend) as exc:
             raise InvalidMessage(f"cannot run {message.task_path!r}: {exc}") from exc
 

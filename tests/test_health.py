@@ -157,7 +157,8 @@ def get(port: int, path: str) -> tuple[int, str, str]:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as response:
             return response.status, response.headers["Content-Type"], response.read().decode()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.headers["Content-Type"], exc.read().decode()
+        with exc:  # close the response, or Python 3.14 warns about the leak
+            return exc.code, exc.headers["Content-Type"], exc.read().decode()
 
 
 def test_health_server(sqs: SQSClient) -> None:

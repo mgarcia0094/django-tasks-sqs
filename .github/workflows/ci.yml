@@ -38,6 +38,25 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv run --with "django~=${{ matrix.django }}.0" pytest
 
+  integration:
+    # End to end against a real SQS API.
+    runs-on: ubuntu-latest
+    services:
+      localstack:
+        image: localstack/localstack:4
+        ports: ["4566:4566"]
+        env:
+          SERVICES: sqs
+        options: >-
+          --health-cmd "curl -fs http://localhost:4566/_localstack/health"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      LOCALSTACK_ENDPOINT: http://localhost:4566
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv run pytest -m integration --no-cov
+
   test-lowest:
     # Make sure the declared minimum versions really work.
     runs-on: ubuntu-latest

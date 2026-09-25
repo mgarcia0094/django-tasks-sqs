@@ -74,6 +74,7 @@ django_settings_module = "tests.settings"
 DJANGO_SETTINGS_MODULE = "tests.settings"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = ["integration: end-to-end tests against LocalStack (need LOCALSTACK_ENDPOINT)"]
 addopts = ["--strict-markers", "--cov=django_tasks_sqs", "--cov-report=term-missing"]
 filterwarnings = [
     "error",

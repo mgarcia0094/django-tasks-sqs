@@ -9,6 +9,7 @@ from typing import Any
 from django.core.management.base import BaseCommand, CommandParser
 from django.tasks import DEFAULT_TASK_BACKEND_ALIAS
 
+from django_tasks_sqs.health import HealthServer
 from django_tasks_sqs.worker import Worker, WorkerOptions
 
 
@@ -49,6 +50,20 @@ class Command(BaseCommand):
             action="store_true",
             help="Don't extend the visibility timeout of running tasks.",
         )
+        parser.add_argument(
+            "--health-port",
+            type=int,
+            default=None,
+            help="Serve /healthz and /metrics (Prometheus) on this port. Off by default.",
+        )
+        parser.add_argument("--health-host", default="0.0.0.0", help="Address for --health-port.")
+        parser.add_argument(
+            "--health-max-age",
+            type=float,
+            default=60,
+            help="Seconds an idle thread may go without polling SQS before /healthz "
+            "reports unhealthy (default: %(default)s).",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         worker = Worker(
@@ -70,4 +85,17 @@ class Command(BaseCommand):
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, shutdown)
 
-        worker.run()
+        health = None
+        if options["health_port"] is not None:
+            health = HealthServer(
+                worker,
+                host=options["health_host"],
+                port=options["health_port"],
+                max_age=options["health_max_age"],
+            )
+            health.start()
+        try:
+            worker.run()
+        finally:
+            if health is not None:
+                health.stop()

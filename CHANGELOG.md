@@ -10,6 +10,9 @@ All notable changes to this project are documented here. The format follows
 
 - `SQSBackend.enqueue_many()` / `aenqueue_many()` enqueue many tasks with
   `SendMessageBatch`, raising `EnqueueBatchError` on partial failures (#2).
+- Worker health checks and metrics (#4): `sqs_worker --health-port` serves `/healthz`
+  and Prometheus `/metrics`; `Worker.stats` exposes counters and liveness; the new
+  `message_processed` signal carries queue, outcome and duration for other backends.
 
 ## [0.1.0] - 2026-09-25
 

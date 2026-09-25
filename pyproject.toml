@@ -1,6 +1,6 @@
 [project]
 name = "django-tasks-sqs"
-version = "0.1.0"
+version = "0.2.0"
 description = "Amazon SQS backend and worker for Django's built-in tasks framework (django.tasks)"
 readme = "README.md"
 license = "MIT"

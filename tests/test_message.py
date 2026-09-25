@@ -68,3 +68,14 @@ def test_unknown_version() -> None:
     body["v"] = 99
     with pytest.raises(InvalidMessage, match="version"):
         TaskMessage.from_json(json.dumps(body))
+
+
+def test_priority_roundtrip() -> None:
+    message = make(priority=-20)
+    assert TaskMessage.from_json(message.to_json()) == message
+
+
+def test_messages_without_priority_still_parse() -> None:
+    body = json.loads(make().to_json())
+    del body["priority"]  # sent by 0.1.0
+    assert TaskMessage.from_json(json.dumps(body)).priority == 0

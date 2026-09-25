@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
 import boto3
 from asgiref.sync import sync_to_async
 from django.core import checks
+from django.core.exceptions import ImproperlyConfigured
 from django.tasks import Task, TaskResult, TaskResultStatus
 from django.tasks.backends.base import BaseTaskBackend
+from django.tasks.base import DEFAULT_TASK_PRIORITY
 from django.tasks.exceptions import InvalidTask
 from django.tasks.signals import task_enqueued
 from django.utils import timezone
@@ -40,6 +44,7 @@ KNOWN_OPTIONS = {
     "endpoint_url",
     "client_kwargs",
     "fifo_message_group_id",
+    "priority_levels",
 }
 
 
@@ -53,6 +58,49 @@ def delay_seconds(run_after: datetime | None, now: datetime) -> int:
         return 0
     remaining = (run_after - now).total_seconds()
     return max(0, min(MAX_DELAY_SECONDS, int(remaining + 0.999)))
+
+
+@dataclass(frozen=True, slots=True)
+class PriorityLevel:
+    """Tasks with ``priority >= min_priority`` go to ``<queue><suffix>``."""
+
+    min_priority: int
+    suffix: str
+    weight: int
+    """How often the worker polls this level relative to the others."""
+
+
+def parse_priority_levels(value: Sequence[Sequence[Any]]) -> tuple[PriorityLevel, ...]:
+    """Validate the ``priority_levels`` option.
+
+    Each item is ``(min_priority, suffix)`` or ``(min_priority, suffix, weight)``,
+    highest priority first. Weights default to powers of two (…4, 2, 1).
+    """
+    levels = []
+    for i, item in enumerate(value):
+        if not 2 <= len(item) <= 3:
+            raise ImproperlyConfigured(
+                f"priority_levels items are (min_priority, suffix[, weight]), got {item!r}"
+            )
+        weight = item[2] if len(item) == 3 else 2 ** (len(value) - 1 - i)
+        min_priority, suffix = item[0], item[1]
+        if not isinstance(min_priority, int) or not isinstance(suffix, str):
+            raise ImproperlyConfigured(f"Invalid priority level {item!r}")
+        if not isinstance(weight, int) or weight < 1:
+            raise ImproperlyConfigured(f"Priority level weights must be positive: {item!r}")
+        levels.append(PriorityLevel(min_priority, suffix, weight))
+    if any(a.min_priority <= b.min_priority for a, b in pairwise(levels)):
+        raise ImproperlyConfigured("priority_levels must be sorted by min_priority, highest first")
+    if len({level.suffix for level in levels}) != len(levels):
+        raise ImproperlyConfigured("priority_levels suffixes must be unique")
+    return tuple(levels)
+
+
+def with_suffix(queue_name: str, suffix: str) -> str:
+    """Append a priority suffix, keeping ``.fifo`` at the end where SQS needs it."""
+    if queue_name.endswith(".fifo"):
+        return queue_name.removesuffix(".fifo") + suffix + ".fifo"
+    return queue_name + suffix
 
 
 class EnqueueBatchError(Exception):
@@ -88,6 +136,8 @@ class SQSBackend(BaseTaskBackend):
                     "queue_name_prefix": "myapp-",
                     "region_name": "eu-west-1",
                     "endpoint_url": None,  # e.g. LocalStack
+                    # Optional: one SQS queue per priority level ("myapp-emails-high"...).
+                    "priority_levels": [(50, "-high"), (0, ""), (-100, "-low")],
                 },
             }
         }
@@ -103,6 +153,8 @@ class SQSBackend(BaseTaskBackend):
         self.queue_urls: dict[str, str] = dict(self.options.get("queue_urls", {}))
         self.queue_name_prefix: str = self.options.get("queue_name_prefix", "")
         self.fifo_message_group_id: str = self.options.get("fifo_message_group_id", "default")
+        self.priority_levels = parse_priority_levels(self.options.get("priority_levels", ()))
+        self.supports_priority = bool(self.priority_levels)
         self._client: SQSClient | None = None
         self._lock = threading.Lock()
 
@@ -130,6 +182,22 @@ class SQSBackend(BaseTaskBackend):
             self.queue_urls[queue_name] = url
         return url
 
+    def sqs_queue_name(self, queue_name: str, priority: int = DEFAULT_TASK_PRIORITY) -> str:
+        """Name (without prefix) of the SQS queue for a task queue and priority."""
+        if not self.priority_levels:
+            return queue_name
+        level = next(
+            (lvl for lvl in self.priority_levels if priority >= lvl.min_priority),
+            self.priority_levels[-1],
+        )
+        return with_suffix(queue_name, level.suffix)
+
+    def sqs_queue_names(self, queue_name: str) -> list[tuple[str, int]]:
+        """Every SQS queue behind a task queue, highest priority first, with its weight."""
+        if not self.priority_levels:
+            return [(queue_name, 1)]
+        return [(with_suffix(queue_name, lvl.suffix), lvl.weight) for lvl in self.priority_levels]
+
     @staticmethod
     def is_fifo(queue_url: str) -> bool:
         return queue_url.endswith(".fifo")
@@ -153,7 +221,7 @@ class SQSBackend(BaseTaskBackend):
 
     def send(self, message: TaskMessage, *, now: datetime | None = None) -> str:
         """Send a task message and return the SQS message id."""
-        queue_url = self.get_queue_url(message.queue_name)
+        queue_url = self.get_queue_url(self.sqs_queue_name(message.queue_name, message.priority))
         request = self._message_request(message, queue_url, now or timezone.now())
         return self.client.send_message(QueueUrl=queue_url, **request)["MessageId"]
 
@@ -161,7 +229,7 @@ class SQSBackend(BaseTaskBackend):
 
     def validate_task(self, task: Task[..., Any]) -> None:
         super().validate_task(task)
-        explicit_url = self.queue_urls.get(task.queue_name)
+        explicit_url = self.queue_urls.get(self.sqs_queue_name(task.queue_name, task.priority))
         if task.run_after is not None and explicit_url and self.is_fifo(explicit_url):
             raise InvalidTask("FIFO queues do not support run_after (per-message delays).")
 
@@ -193,8 +261,10 @@ class SQSBackend(BaseTaskBackend):
             backend=self.alias,
             enqueued_at=now,
             run_after=task.run_after,
+            priority=task.priority,
         )
-        if message.run_after is not None and self.is_fifo(self.get_queue_url(task.queue_name)):
+        queue_url = self.get_queue_url(self.sqs_queue_name(task.queue_name, task.priority))
+        if message.run_after is not None and self.is_fifo(queue_url):
             raise InvalidTask("FIFO queues do not support run_after (per-message delays).")
         return result, message
 
@@ -223,7 +293,8 @@ class SQSBackend(BaseTaskBackend):
 
         by_queue: dict[str, list[tuple[TaskResult[..., Any], TaskMessage]]] = {}
         for result, message in prepared:
-            by_queue.setdefault(message.queue_name, []).append((result, message))
+            key = self.sqs_queue_name(message.queue_name, message.priority)
+            by_queue.setdefault(key, []).append((result, message))
 
         failed: dict[str, str] = {}
         for queue_name, items in by_queue.items():
@@ -267,7 +338,8 @@ class SQSBackend(BaseTaskBackend):
                     id="django_tasks_sqs.W001",
                 )
             )
-        extra = set(self.queue_urls) - self.queues
+        known = {name for q in self.queues for name, _ in self.sqs_queue_names(q)}
+        extra = set(self.queue_urls) - known
         if extra:
             messages.append(
                 checks.Warning(

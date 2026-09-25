@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +22,9 @@ from django.utils.json import normalize_json
 from django.utils.module_loading import import_string
 
 from .backend import SQSBackend
+from .health import WorkerStats
 from .message import InvalidMessage, TaskMessage
+from .signals import message_processed
 
 if TYPE_CHECKING:
     from mypy_boto3_sqs.type_defs import MessageTypeDef
@@ -95,6 +98,7 @@ class Worker:
         self.worker_id = get_random_string(32)
         self._stop = threading.Event()
         self._visibility_timeouts: dict[str, int] = {}
+        self.stats = WorkerStats(self.queue_names)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -129,10 +133,12 @@ class Worker:
         logger.info("Worker %s stopped", self.worker_id)
 
     def _poll_forever(self, queue_name: str) -> None:
+        self.stats.register_thread()
         while not self.stopping:
             try:
                 self.run_once(queue_name)
             except Exception:
+                self.stats.poll_failed(queue_name)
                 logger.exception("Error polling queue %s; retrying in 5s", queue_name)
                 self._stop.wait(5)
 
@@ -151,10 +157,28 @@ class Worker:
         if self.options.visibility_timeout is not None:
             request["VisibilityTimeout"] = self.options.visibility_timeout
         response = self.backend.client.receive_message(**request)
-        return [self.process(queue_name, m) for m in response.get("Messages", [])]
+        self.stats.polled()
+        messages = response.get("Messages", [])
+        if not messages:
+            return []
+        with self.stats.busy():
+            return [self.process(queue_name, m) for m in messages]
 
     def process(self, queue_name: str, sqs_message: MessageTypeDef) -> str:
-        """Handle a single received SQS message."""
+        """Handle a single received SQS message. Returns an :class:`Outcome` value."""
+        started = time.monotonic()
+        outcome = self._process(queue_name, sqs_message)
+        self.stats.processed(queue_name, outcome)
+        message_processed.send(
+            type(self),
+            worker=self,
+            queue_name=queue_name,
+            outcome=outcome,
+            duration=time.monotonic() - started,
+        )
+        return outcome
+
+    def _process(self, queue_name: str, sqs_message: MessageTypeDef) -> str:
         queue_url = self.backend.get_queue_url(queue_name)
         receipt = sqs_message["ReceiptHandle"]
         attempt = int(sqs_message.get("Attributes", {}).get("ApproximateReceiveCount", "1"))

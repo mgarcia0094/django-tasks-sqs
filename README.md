@@ -73,6 +73,8 @@ The queues must already exist. Create them with your usual infrastructure toolin
   exits. Plays well with ECS, Kubernetes and systemd.
 - **Batch enqueue:** `backend.enqueue_many(...)` sends many tasks with
   `SendMessageBatch` (see below).
+- **Health checks and metrics:** `--health-port` serves `/healthz` and Prometheus
+  `/metrics`; the `message_processed` signal feeds any other metrics system.
 - **FIFO queues** (queue names ending in `.fifo`).
 - **Typed, with 100% test coverage.** Tested against Django 6.0 and 6.1 on Python 3.12–3.14.
 
@@ -168,6 +170,8 @@ again, and another worker picks it up.
 | [`backend.py`](src/django_tasks_sqs/backend.py) | `SQSBackend`: settings, boto3 client, queue URL resolution, `enqueue`, system checks |
 | [`message.py`](src/django_tasks_sqs/message.py) | `TaskMessage`: the JSON envelope and its validation |
 | [`worker.py`](src/django_tasks_sqs/worker.py) | `Worker`: polling threads, execution, retries, heartbeat, deferral |
+| [`health.py`](src/django_tasks_sqs/health.py) | `WorkerStats` (counters, liveness) and the `/healthz` + `/metrics` server |
+| [`signals.py`](src/django_tasks_sqs/signals.py) | `message_processed` |
 | [`management/commands/sqs_worker.py`](src/django_tasks_sqs/management/commands/sqs_worker.py) | CLI flags and signal handling |
 
 ## Worker options
@@ -182,8 +186,48 @@ again, and another worker picks it up.
 | `--visibility-timeout` | queue's | Override for received messages |
 | `--retry-backoff` | off | Base seconds for exponential backoff: `base * 2**(attempt-1)` |
 | `--no-heartbeat` | | Don't extend visibility while tasks run |
+| `--health-port` | off | Serve `/healthz` and `/metrics` on this port |
+| `--health-host` | `0.0.0.0` | Address for `--health-port` |
+| `--health-max-age` | 60 | Seconds an idle thread may go without polling before `/healthz` fails |
 
 You can also run a worker from code with `django_tasks_sqs.Worker`.
+
+## Health checks and metrics
+
+```bash
+python manage.py sqs_worker --health-port 8000
+```
+
+- **`GET /healthz`** returns `200 ok` or `503 unhealthy`. The worker is healthy when
+  every polling thread either received from SQS successfully in the last
+  `--health-max-age` seconds or is busy running a task. So a long task never fails the
+  check, but a worker stuck retrying (expired credentials, no network) does. Point a
+  Kubernetes liveness probe or an ECS health check (`curl -f`) at it.
+- **`GET /metrics`** uses the Prometheus text format:
+
+  | Metric | Type | |
+  |---|---|---|
+  | `django_tasks_sqs_messages_total{queue,outcome}` | counter | `succeeded`, `failed`, `deferred`, `invalid` |
+  | `django_tasks_sqs_poll_errors_total{queue}` | counter | Failed `ReceiveMessage` calls |
+  | `django_tasks_sqs_busy_threads` | gauge | Threads running a task |
+  | `django_tasks_sqs_last_poll_age_seconds` | gauge | Seconds since the stalest idle thread polled |
+  | `django_tasks_sqs_healthy` | gauge | 1 or 0, as `/healthz` |
+
+For CloudWatch, StatsD or anything else, connect to the `message_processed` signal. It
+is sent after every message with `worker`, `queue_name`, `outcome` and `duration`
+(seconds):
+
+```python
+from django.dispatch import receiver
+from django_tasks_sqs.signals import message_processed
+
+@receiver(message_processed)
+def record(sender, queue_name, outcome, duration, **kwargs):
+    statsd.timing(f"tasks.{queue_name}.{outcome}", duration * 1000)
+```
+
+When running a `Worker` from code, the same data is in `worker.stats`, and
+`django_tasks_sqs.health.HealthServer(worker, port=...)` serves the endpoints.
 
 ## Things to know
 
@@ -220,9 +264,9 @@ Ideas where help is very welcome. Open an issue to discuss before starting somet
 - [ ] Optional result storage (e.g. in the Django database), so `get_result()` works
 - [x] Batch sends (`SendMessageBatch`) for enqueueing many tasks at once
 - [ ] Priorities emulated with several queues and weighted polling
-- [ ] Health check and metrics hooks for the worker (Prometheus / CloudWatch)
+- [x] Health check and metrics hooks for the worker (Prometheus / CloudWatch)
 - [ ] Payloads over 256 KB stored in S3 (extended client pattern)
-- [ ] Integration tests against LocalStack in CI
+- [x] Integration tests against LocalStack in CI
 
 ## Contributing
 

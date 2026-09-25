@@ -35,6 +35,14 @@ uv run mypy              # strict type checking
 
 Test another Django version with `uv run --with "django~=6.0.0" pytest`.
 
+The tests in `tests/integration/` run the worker against a real SQS API and are skipped
+unless `LOCALSTACK_ENDPOINT` is set. CI runs them; to run them locally:
+
+```bash
+docker run --rm -d -p 4566:4566 -e SERVICES=sqs localstack/localstack:4
+LOCALSTACK_ENDPOINT=http://localhost:4566 uv run pytest -m integration --no-cov
+```
+
 Optionally, install the git hooks so formatting happens on commit:
 
 ```bash

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from django.tasks import TaskContext, task
@@ -43,3 +44,9 @@ def place_order(order_id: int) -> None:
 
 
 NOT_A_TASK = 42
+
+
+@task
+def nap(seconds: float) -> None:
+    time.sleep(seconds)
+    calls.append(("nap", seconds))

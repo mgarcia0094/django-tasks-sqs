@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `SQSBackend.enqueue_many()` / `aenqueue_many()` enqueue many tasks with
+  `SendMessageBatch`, raising `EnqueueBatchError` on partial failures (#2).
+
 ## [0.1.0] - 2026-09-25
 
 First release.

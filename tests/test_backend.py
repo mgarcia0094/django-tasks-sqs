@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -12,7 +13,7 @@ from django.tasks.exceptions import InvalidTask
 from django.tasks.signals import task_enqueued
 from mypy_boto3_sqs import SQSClient
 
-from django_tasks_sqs import SQSBackend
+from django_tasks_sqs import EnqueueBatchError, SQSBackend
 from django_tasks_sqs.backend import MAX_DELAY_SECONDS, delay_seconds
 from tests import tasks
 from tests.conftest import sqs_backend
@@ -189,3 +190,138 @@ def test_check_warns_about_unknown_options_and_queues() -> None:
 
 def test_check_is_clean_by_default() -> None:
     assert SQSBackend("x", {}).check() == []
+
+
+# -------------------------------------------------------------- enqueue_many
+
+
+def spy_batches(backend: SQSBackend) -> Any:
+    return mock.patch.object(
+        backend.client, "send_message_batch", wraps=backend.client.send_message_batch
+    )
+
+
+def test_enqueue_many_sends_one_batch_per_queue(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    received: list[Any] = []
+
+    def handler(sender: Any, task_result: Any, **kwargs: Any) -> None:
+        received.append(task_result)
+
+    task_enqueued.connect(handler)
+    try:
+        with spy_batches(backend) as spy:
+            results = backend.enqueue_many(
+                [
+                    (tasks.add, [1, 2], {}),
+                    (tasks.send_email, ["a@b.c"], {"subject": "hi"}),
+                    (tasks.add, (3, 4), {}),
+                ]
+            )
+    finally:
+        task_enqueued.disconnect(handler)
+
+    assert spy.call_count == 2
+    assert [r.task.name for r in results] == ["add", "send_email", "add"]
+    assert all(r.status == TaskResultStatus.READY for r in results)
+    assert sorted(r.id for r in received) == sorted(r.id for r in results)
+    default = sorted(json.loads(m["Body"])["args"] for m in receive(sqs))
+    assert default == [[1, 2], [3, 4]]
+    [email] = receive(sqs, "test-emails")
+    body = json.loads(email["Body"])
+    assert body["id"] == results[1].id
+    assert body["kwargs"] == {"subject": "hi"}
+    assert email["MessageAttributes"]["task"]["StringValue"] == "tests.tasks.send_email"
+
+
+def test_enqueue_many_splits_into_batches_of_ten(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    with spy_batches(backend) as spy:
+        results = backend.enqueue_many((tasks.add, [i, i], {}) for i in range(23))
+    assert [len(c.kwargs["Entries"]) for c in spy.call_args_list] == [10, 10, 3]
+    assert len(results) == 23
+
+
+def test_enqueue_many_splits_by_size(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    # Each message is a bit over 1000 bytes, so only two fit under the limit.
+    with spy_batches(backend) as spy, mock.patch("django_tasks_sqs.backend.MAX_BATCH_BYTES", 2500):
+        backend.enqueue_many([(tasks.send_email, ["x" * 1000], {}) for _ in range(3)])
+    assert [len(c.kwargs["Entries"]) for c in spy.call_args_list] == [2, 1]
+
+
+def test_enqueue_many_fifo_keeps_order_and_deduplicates(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    with spy_batches(backend) as spy:
+        results = backend.enqueue_many([(tasks.place_order, [i], {}) for i in range(3)])
+    entries = spy.call_args.kwargs["Entries"]
+    assert [e["MessageDeduplicationId"] for e in entries] == [r.id for r in results]
+    assert {e["MessageGroupId"] for e in entries} == {"default"}
+    assert all("DelaySeconds" not in e for e in entries)
+
+
+def test_enqueue_many_defers(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    deferred = tasks.add.using(run_after=datetime.now(UTC) + timedelta(seconds=60))
+    with spy_batches(backend) as spy:
+        backend.enqueue_many([(deferred, [1, 1], {}), (tasks.add, [2, 2], {})])
+    delays = [e["DelaySeconds"] for e in spy.call_args.kwargs["Entries"]]
+    assert 59 <= delays[0] <= 60
+    assert delays[1] == 0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        tasks.add.using(backend="immediate"),
+        tasks.place_order.using(run_after=datetime.now(UTC) + timedelta(minutes=1)),
+    ],
+)
+def test_enqueue_many_validates_everything_before_sending(sqs: SQSClient, bad: Any) -> None:
+    backend = sqs_backend()
+    with spy_batches(backend) as spy, pytest.raises(InvalidTask):
+        backend.enqueue_many([(tasks.add, [1, 1], {}), (bad, [1], {})])
+    assert spy.call_count == 0
+    assert receive(sqs) == []
+
+
+def test_enqueue_many_reports_partial_failures(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    received: list[Any] = []
+
+    def handler(sender: Any, task_result: Any, **kwargs: Any) -> None:
+        received.append(task_result)
+
+    response = {
+        "Successful": [],
+        "Failed": [{"Id": "1", "SenderFault": True, "Code": "Throttled", "Message": "slow down"}],
+    }
+    task_enqueued.connect(handler)
+    try:
+        with (
+            mock.patch.object(backend.client, "send_message_batch", return_value=response),
+            pytest.raises(EnqueueBatchError, match="1 of 3 tasks were not sent") as excinfo,
+        ):
+            backend.enqueue_many([(tasks.add, [i, i], {}) for i in range(3)])
+    finally:
+        task_enqueued.disconnect(handler)
+
+    error = excinfo.value
+    assert [r.args for r in error.enqueued] == [[0, 0], [2, 2]]
+    [(failed, reason)] = error.failed
+    assert failed.args == [1, 1]
+    assert reason == "Throttled: slow down"
+    assert received == error.enqueued
+
+
+def test_enqueue_many_with_nothing_sends_nothing(sqs: SQSClient) -> None:
+    backend = sqs_backend()
+    with spy_batches(backend) as spy:
+        assert backend.enqueue_many([]) == []
+    assert spy.call_count == 0
+
+
+def test_aenqueue_many(sqs: SQSClient) -> None:
+    results = asyncio.run(sqs_backend().aenqueue_many([(tasks.add, [5, 6], {})]))
+    [message] = receive(sqs)
+    assert json.loads(message["Body"])["id"] == results[0].id

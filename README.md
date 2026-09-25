@@ -71,8 +71,29 @@ The queues must already exist. Create them with your usual infrastructure toolin
   the task runs, so another worker doesn't pick it up halfway through.
 - **Graceful shutdown:** on `SIGTERM`/`SIGINT` the worker finishes its current tasks and
   exits. Plays well with ECS, Kubernetes and systemd.
+- **Batch enqueue:** `backend.enqueue_many(...)` sends many tasks with
+  `SendMessageBatch` (see below).
 - **FIFO queues** (queue names ending in `.fifo`).
 - **Typed, with 100% test coverage.** Tested against Django 6.0 and 6.1 on Python 3.12–3.14.
+
+### Enqueueing many tasks at once
+
+`django.tasks` has no bulk API, so the backend adds one. `enqueue_many` takes
+`(task, args, kwargs)` tuples and sends them with as few `SendMessageBatch` requests as
+possible (up to 10 messages and 256 KiB per request, one queue per request):
+
+```python
+backend = send_welcome_email.get_backend()
+results = backend.enqueue_many(
+    (send_welcome_email, [], {"user_id": user.pk}) for user in new_users
+)
+```
+
+Every call is validated before anything is sent, and the `TaskResult`s come back in
+the same order. `task_enqueued` is sent for each task. If SQS rejects some messages, the
+rest are still sent and `django_tasks_sqs.EnqueueBatchError` is raised: its
+`enqueued` lists the tasks that went through, and `failed` pairs each rejected task
+with SQS's error. `aenqueue_many` is the async version.
 
 ## How it works
 
@@ -197,7 +218,7 @@ For unit tests, use Django's `ImmediateBackend` instead, which runs tasks inline
 Ideas where help is very welcome. Open an issue to discuss before starting something big:
 
 - [ ] Optional result storage (e.g. in the Django database), so `get_result()` works
-- [ ] Batch sends (`SendMessageBatch`) for enqueueing many tasks at once
+- [x] Batch sends (`SendMessageBatch`) for enqueueing many tasks at once
 - [ ] Priorities emulated with several queues and weighted polling
 - [ ] Health check and metrics hooks for the worker (Prometheus / CloudWatch)
 - [ ] Payloads over 256 KB stored in S3 (extended client pattern)

@@ -10,7 +10,7 @@ from datetime import timedelta
 from django.utils import timezone
 from mypy_boto3_sqs import SQSClient
 
-from django_tasks_sqs import Worker, WorkerOptions
+from django_tasks_sqs import SQSBackend, Worker, WorkerOptions
 from django_tasks_sqs.worker import Outcome
 from tests import tasks
 
@@ -116,3 +116,24 @@ def test_run_until_stopped(sqs: SQSClient, prefix: str) -> None:
     thread.join(timeout=10)
     assert not thread.is_alive()
     assert sorted(name for name, _ in tasks.calls) == ["add", "add", "add", "send_email"]
+
+
+def test_enqueue_many(sqs: SQSClient, prefix: str) -> None:
+    backend = tasks.add.get_backend()
+    assert isinstance(backend, SQSBackend)
+    results = backend.enqueue_many(
+        [(tasks.add, [i, i], {}) for i in range(12)]
+        # ~60 KB each: forces size-based splitting under the 256 KiB batch limit.
+        + [(tasks.send_email, ["x" * 60_000], {}) for _ in range(5)]
+        + [(tasks.place_order, [i], {}) for i in range(12)]
+    )
+    assert len(results) == 29
+    w = Worker(options=WorkerOptions(wait_time_seconds=1, max_messages=10, heartbeat=False))
+    for queue in ("default", "emails", "orders.fifo"):
+        while w.run_once(queue):
+            pass
+    added = [args for name, args in tasks.calls if name == "add"]
+    assert len(added) == 12
+    assert set(added) == {(i, i) for i in range(12)}
+    assert len([name for name, _ in tasks.calls if name == "send_email"]) == 5
+    assert [a for name, a in tasks.calls if name == "place_order"] == list(range(12))

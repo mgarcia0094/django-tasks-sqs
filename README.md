@@ -85,8 +85,69 @@ The queues must already exist. Create them with your usual infrastructure toolin
                         visibility timeout expires ◀── failure ────┘ (retry / DLQ)
 ```
 
-The message carries the task's import path, its JSON arguments and some metadata. No
-code or pickles travel through the queue.
+### 1. Enqueueing
+
+`task.enqueue(*args, **kwargs)` runs in your web process. `SQSBackend`:
+
+1. validates the task, as `django.tasks` requires: module-level function, JSON-serialisable
+   arguments, a queue listed in `QUEUES`…;
+2. resolves the SQS queue URL, either from `queue_urls` or by calling `GetQueueUrl` with
+   `queue_name_prefix + queue_name` (the result is cached);
+3. sends one message and returns a `TaskResult` with status `READY`.
+
+The message body is a small, versioned JSON envelope. Only the task's **import path**
+travels, never code or pickles:
+
+```json
+{"v": 1, "id": "…", "task": "myapp.tasks.send_welcome_email",
+ "args": [], "kwargs": {"user_id": 42}, "queue_name": "default",
+ "backend": "default", "enqueued_at": "2026-09-25T10:00:00+00:00", "run_after": null}
+```
+
+The task path is also sent as a message attribute (`task`), which is handy for
+filtering and debugging in the AWS console.
+
+### 2. Deferring (`run_after`)
+
+SQS can delay a message for at most 15 minutes (`DelaySeconds`). For longer delays the
+backend sends the message with the maximum delay. When a worker receives it before
+`run_after`, it sends a new copy delayed again and deletes the original. This repeats
+until the task is due, so a task can be deferred for any length of time.
+
+### 3. Consuming
+
+`manage.py sqs_worker` starts `--concurrency` threads per queue. Each thread loops:
+
+1. **Long-polls** SQS (`ReceiveMessage` with `WaitTimeSeconds=20`), which is cheap
+   when the queue is idle.
+2. **Imports the task** by path. If the message is malformed or the task can't be
+   imported, it is logged and left alone, so the redrive policy eventually moves it
+   to the DLQ.
+3. **Runs it** exactly like Django's `ImmediateBackend` does: it builds a `TaskResult`,
+   sends `task_started`, calls the function (sync or async, with `TaskContext` if
+   `takes_context=True`), sends `task_finished`, and closes stale DB connections
+   before and after.
+4. **Acknowledges or retries.** On success the message is **deleted**. On failure it is
+   **kept**: SQS delivers it again when the visibility timeout expires, or after
+   `--retry-backoff` seconds (doubling each attempt) if you set it.
+
+While a task runs, a **heartbeat** thread calls `ChangeMessageVisibility` every half
+timeout, so a slow task is never handed to a second worker.
+
+### 4. Shutting down
+
+`SIGTERM`/`SIGINT` sets a stop flag. Threads finish the task they are running, stop
+polling and exit. A message that was received but not finished simply becomes visible
+again, and another worker picks it up.
+
+### Code map
+
+| Module | What lives there |
+|---|---|
+| [`backend.py`](src/django_tasks_sqs/backend.py) | `SQSBackend`: settings, boto3 client, queue URL resolution, `enqueue`, system checks |
+| [`message.py`](src/django_tasks_sqs/message.py) | `TaskMessage`: the JSON envelope and its validation |
+| [`worker.py`](src/django_tasks_sqs/worker.py) | `Worker`: polling threads, execution, retries, heartbeat, deferral |
+| [`management/commands/sqs_worker.py`](src/django_tasks_sqs/management/commands/sqs_worker.py) | CLI flags and signal handling |
 
 ## Worker options
 
@@ -131,14 +192,32 @@ Point `endpoint_url` at [LocalStack](https://www.localstack.cloud/) or
 
 For unit tests, use Django's `ImmediateBackend` instead, which runs tasks inline.
 
+## Roadmap
+
+Ideas where help is very welcome. Open an issue to discuss before starting something big:
+
+- [ ] Optional result storage (e.g. in the Django database), so `get_result()` works
+- [ ] Batch sends (`SendMessageBatch`) for enqueueing many tasks at once
+- [ ] Priorities emulated with several queues and weighted polling
+- [ ] Health check and metrics hooks for the worker (Prometheus / CloudWatch)
+- [ ] Payloads over 256 KB stored in S3 (extended client pattern)
+- [ ] Integration tests against LocalStack in CI
+
 ## Contributing
 
+Contributions of any size are welcome: bug reports, docs, tests, features. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md). In short:
+
 ```bash
+git clone https://github.com/mgarcia0094/django-tasks-sqs && cd django-tasks-sqs
 uv sync              # install with dev dependencies
-uv run pytest        # tests (SQS is mocked with moto)
+uv run pytest        # tests (SQS is mocked with moto, no AWS account needed)
 uv run ruff check .  # lint
 uv run mypy          # strict type checking
 ```
+
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). To report a security issue,
+see [SECURITY.md](SECURITY.md).
 
 ## License
 

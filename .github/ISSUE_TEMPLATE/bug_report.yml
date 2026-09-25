@@ -1,0 +1,36 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Minimal settings, task code and commands. Please remove secrets.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traceback
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: django-tasks-sqs 0.1.0, Django 6.1, Python 3.13, boto3 1.40
+    validations:
+      required: true
+  - type: dropdown
+    id: queue
+    attributes:
+      label: Queue type
+      options: [Standard, FIFO, Not sure]

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/mgarcia0094/django-tasks-sqs/discussions
+    about: Ask questions and discuss ideas in GitHub Discussions.
